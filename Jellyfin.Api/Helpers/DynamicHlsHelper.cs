@@ -268,9 +268,10 @@ public class DynamicHlsHelper
                 }
             }
 
-            // Provide H.264 SDR entrance for backward compatibility.
+            // This hardware-specific HDR mode must not advertise an SDR escape route.
             if (EncodingHelper.IsCopyCodec(state.OutputVideoCodec)
-                && state.VideoStream.VideoRange == VideoRange.HDR)
+                && state.VideoStream.VideoRange == VideoRange.HDR
+                && !encodingOptions.EnableAv1HdrTranscoding)
             {
                 // Force H.264 and disable video stream copy.
                 state.OutputVideoCodec = "h264";
@@ -470,8 +471,13 @@ public class DynamicHlsHelper
             }
             else
             {
-                // Currently we only encode to SDR.
-                builder.Append(",VIDEO-RANGE=SDR");
+                var hdrRange = Av1HdrTranscoding.GetOutputRange(state, _serverConfigurationManager.GetEncodingOptions());
+                builder.Append(hdrRange switch
+                {
+                    VideoRangeType.HDR10 => ",VIDEO-RANGE=PQ",
+                    VideoRangeType.HLG => ",VIDEO-RANGE=HLG",
+                    _ => ",VIDEO-RANGE=SDR"
+                });
             }
         }
     }
@@ -937,8 +943,7 @@ public class DynamicHlsHelper
         {
             string profile = GetOutputVideoCodecProfile(state, "av1");
 
-            // Currently we only transcode to 8 bits AV1
-            int bitDepth = 8;
+            int bitDepth = Av1HdrTranscoding.GetOutputRange(state, _serverConfigurationManager.GetEncodingOptions()).HasValue ? 10 : 8;
             if (EncodingHelper.IsCopyCodec(state.OutputVideoCodec)
                 && state.VideoStream is not null
                 && state.VideoStream.BitDepth.HasValue)

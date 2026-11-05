@@ -58,6 +58,7 @@ public class EncodingOptions
         EnableHardwareEncoding = true;
         AllowHevcEncoding = false;
         AllowAv1Encoding = false;
+        EnableAv1HdrTranscoding = true;
         EnableSubtitleExtraction = true;
         SubtitleExtractionTimeoutMinutes = 30;
         AllowOnDemandMetadataBasedKeyframeExtractionForExtensions = ["mkv"];
@@ -284,6 +285,12 @@ public class EncodingOptions
     /// Gets or sets a value indicating whether AV1 encoding is enabled.
     /// </summary>
     public bool AllowAv1Encoding { get; set; }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether the Wildcat Lake QSV path preserves HDR in AV1 transcodes.
+    /// SDR sources continue using the original pipeline.
+    /// </summary>
+    public bool EnableAv1HdrTranscoding { get; set; }
 
     /// <summary>
     /// Gets or sets a value indicating whether subtitle extraction is enabled.

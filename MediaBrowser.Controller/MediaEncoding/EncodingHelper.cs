@@ -358,6 +358,11 @@ namespace MediaBrowser.Controller.MediaEncoding
 
         private bool IsHwTonemapAvailable(EncodingJobInfo state, EncodingOptions options)
         {
+            if (Av1HdrTranscoding.GetOutputRange(state, options).HasValue)
+            {
+                return false;
+            }
+
             if (state.VideoStream is null
                 || !options.EnableTonemapping
                 || GetVideoColorBitDepth(state) < 10)
@@ -406,6 +411,11 @@ namespace MediaBrowser.Controller.MediaEncoding
 
         private bool IsIntelVppTonemapAvailable(EncodingJobInfo state, EncodingOptions options)
         {
+            if (Av1HdrTranscoding.GetOutputRange(state, options).HasValue)
+            {
+                return false;
+            }
+
             if (state.VideoStream is null
                 || !options.EnableVppTonemapping
                 || GetVideoColorBitDepth(state) < 10)
@@ -2410,6 +2420,14 @@ namespace MediaBrowser.Controller.MediaEncoding
                 && _mediaEncoder.EncoderVersion >= _minFFmpegSvtAv1Params)
             {
                 param += " -svtav1-params:0 rc=1:tune=0:film-grain=0:enable-overlays=1:enable-tf=0";
+            }
+
+            var hdrRange = Av1HdrTranscoding.GetOutputRange(state, encodingOptions);
+            if (hdrRange.HasValue)
+            {
+                param += " -color_primaries:v:0 bt2020 -colorspace:v:0 bt2020nc -color_range:v:0 tv"
+                    + " -color_trc:v:0 " + Av1HdrTranscoding.GetTransfer(hdrRange.Value)
+                    + " -bsf:v:0 av1_metadata=remove_dovi=1:remove_hdr10plus=1";
             }
 
             /* Access unit too large: 8192 < 20880 error */
@@ -4475,6 +4493,12 @@ namespace MediaBrowser.Controller.MediaEncoding
                 return (null, null, null);
             }
 
+            var hdrRange = Av1HdrTranscoding.GetOutputRange(state, options);
+            if (hdrRange.HasValue)
+            {
+                return GetQsvAv1HdrFilters(state, options, GetHardwareVideoDecoder(state, options) ?? string.Empty, vidEncoder, hdrRange.Value);
+            }
+
             var isWindows = OperatingSystem.IsWindows();
             var isLinux = OperatingSystem.IsLinux();
             var vidDecoder = GetHardwareVideoDecoder(state, options) ?? string.Empty;
@@ -4509,6 +4533,104 @@ namespace MediaBrowser.Controller.MediaEncoding
             }
 
             return (null, null, null);
+        }
+
+        /// <summary>
+        /// Builds the Wildcat Lake AV1 HDR pipeline. Only subtitle composition leaves GPU memory.
+        /// </summary>
+        /// <param name="state">The encoding job.</param>
+        /// <param name="options">The encoding configuration.</param>
+        /// <param name="vidDecoder">The selected hardware decoder.</param>
+        /// <param name="vidEncoder">The selected hardware encoder.</param>
+        /// <param name="range">The output HDR range.</param>
+        /// <returns>The main, subtitle and composition filter chains.</returns>
+        public (List<string> MainFilters, List<string> SubFilters, List<string> OverlayFilters) GetQsvAv1HdrFilters(
+            EncodingJobInfo state,
+            EncodingOptions options,
+            string vidDecoder,
+            string vidEncoder,
+            VideoRangeType range)
+        {
+            if (!vidDecoder.Contains("vaapi", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(vidEncoder, "av1_qsv", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new NotSupportedException("AV1 HDR on this fork requires native VAAPI decoding and av1_qsv encoding.");
+            }
+
+            var video = state.VideoStream;
+            var request = state.BaseRequest;
+            var rotation = video.Rotation ?? 0;
+            var transpose = rotation == 0 ? string.Empty : GetVideoTransposeDirection(state);
+            var swap = Math.Abs(rotation) == 90 && !string.IsNullOrEmpty(transpose);
+            var width = swap ? video.Height : video.Width;
+            var height = swap ? video.Width : video.Height;
+            var main = new List<string> { GetInputHdrParam(Av1HdrTranscoding.GetTransfer(range)) };
+            var subs = new List<string>();
+            var overlay = new List<string>();
+
+            if (IsDeinterlaceAvailable(state))
+            {
+                main.Add(GetHwDeinterlaceFilter(state, options, "vaapi"));
+            }
+
+            if (!string.IsNullOrEmpty(transpose))
+            {
+                main.Add("transpose_vaapi=dir=" + transpose);
+            }
+
+            var scale = GetHwScaleFilter(
+                "scale",
+                "vaapi",
+                "p010le",
+                false,
+                width,
+                height,
+                request.Width,
+                request.Height,
+                request.MaxWidth,
+                request.MaxHeight);
+            main.Add(scale + ":out_range=tv:extra_hw_frames=24");
+
+            if (state.SubtitleStream is null || !ShouldEncodeSubtitle(state))
+            {
+                main.Add("hwmap=derive_device=qsv");
+                main.Add("format=qsv");
+                return (main, subs, overlay);
+            }
+
+            // overlay_qsv rejects P010 composition on the target hardware. Keep the main
+            // picture 10-bit in a software overlay, then upload it for AV1 hardware encoding.
+            main.Add("hwdownload");
+            main.Add("format=p010le");
+            main.Add("format=yuv420p10le");
+
+            if (state.SubtitleStream.IsTextSubtitleStream)
+            {
+                var ass = string.Equals(state.SubtitleStream.Codec, "ass", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(state.SubtitleStream.Codec, "ssa", StringComparison.OrdinalIgnoreCase);
+                var rate = ass ? Math.Min(video.RealFrameRate ?? 25, 60) : 10;
+                subs.Add(GetAlphaSrcFilter(state, width, height, request.Width, request.Height, request.MaxWidth, request.MaxHeight, rate));
+                subs.Add("format=bgra");
+                subs.Add(GetTextSubtitlesFilter(state, true, true));
+            }
+            else
+            {
+                subs.Add("setparams=alpha_mode=straight");
+                subs.Add(GetGraphicalSubPreProcessFilters(
+                    width,
+                    height,
+                    state.SubtitleStream.Width,
+                    state.SubtitleStream.Height,
+                    request.Width,
+                    request.Height,
+                    request.MaxWidth,
+                    request.MaxHeight));
+            }
+
+            subs.Add(Av1HdrTranscoding.GetSubtitleColorFilter(range, state.SubtitleStream.IsTextSubtitleStream));
+            overlay.Add("overlay=eof_action=pass:repeatlast=0:format=yuv420p10:alpha=straight");
+            overlay.Add("hwupload=derive_device=qsv:extra_hw_frames=24");
+            return (main, subs, overlay);
         }
 
         public (List<string> MainFilters, List<string> SubFilters, List<string> OverlayFilters) GetIntelQsvDx11VidFiltersPrefered(
