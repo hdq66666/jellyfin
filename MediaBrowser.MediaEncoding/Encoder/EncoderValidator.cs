@@ -164,7 +164,10 @@ namespace MediaBrowser.MediaEncoding.Encoder
             { FilterOptionType.OverlayVulkanFrameSync, ("overlay_vulkan", "Action to take when encountering EOF from secondary input") },
             { FilterOptionType.TransposeOpenclReversal, ("transpose_opencl", "rotate by half-turn") },
             { FilterOptionType.OverlayOpenclAlphaFormat, ("overlay_opencl", "alpha_format") },
-            { FilterOptionType.OverlayCudaAlphaFormat, ("overlay_cuda", "alpha_format") }
+            { FilterOptionType.OverlayCudaAlphaFormat, ("overlay_cuda", "alpha_format") },
+            { FilterOptionType.LibplaceboRequireLinearBlend, ("libplacebo", "require_linear_blend") },
+            { FilterOptionType.LibplaceboHlgReferencePeak, ("libplacebo", "hlg_reference_peak") },
+            { FilterOptionType.SubtitlesSub2videoSkip, ("subtitles", "sub2video_skip") }
         };
 
         private static readonly Dictionary<BitStreamFilterOptionType, (string, string)> _bsfOptionsDict = new Dictionary<BitStreamFilterOptionType, (string, string)>

@@ -1,0 +1,190 @@
+diff --git a/libavfilter/vf_libplacebo.c b/libavfilter/vf_libplacebo.c
+index 316eca3..4b888f5 100644
+--- a/libavfilter/vf_libplacebo.c
++++ b/libavfilter/vf_libplacebo.c
+@@ -216,6 +216,7 @@ typedef struct LibplaceboContext {
+     int fit_sense;
+     int apply_filmgrain;
+     int apply_dovi;
++    float hlg_reference_peak;
+     int colorspace;
+     int color_range;
+     int color_primaries;
+@@ -244,6 +245,7 @@ typedef struct LibplaceboContext {
+     int disable_builtin;
+     int force_dither;
+     int disable_fbos;
++    int require_linear_blend;
+ 
+     /* pl_deinterlace_params */
+     int deinterlace;
+@@ -298,6 +300,17 @@ typedef struct LibplaceboContext {
+     int num_hooks;
+ } LibplaceboContext;
+ 
++static void set_hlg_reference(struct pl_color_space *color, float peak)
++{
++    if (peak <= 0.0f || color->transfer != PL_COLOR_TRC_HLG)
++        return;
++
++    if (!color->hdr.max_luma)
++        color->hdr.max_luma = peak;
++    if (!color->hdr.min_luma)
++        color->hdr.min_luma = PL_COLOR_HDR_BLACK;
++}
++
+ static inline enum pl_log_level get_log_level(void)
+ {
+     int av_lev = av_log_get_level();
+@@ -537,6 +550,14 @@ static int update_settings(AVFilterContext *ctx)
+         av_log(avctx, AV_LOG_WARNING, "extra_opts requires libplacebo >= 6.309!\n");
+ #endif
+ 
++    if (s->require_linear_blend &&
++        (s->disable_linear || s->disable_fbos ||
++         opts->params.disable_linear_scaling || opts->params.disable_fbos ||
++         opts->params.force_low_bit_depth_fbos)) {
++        av_log(ctx, AV_LOG_ERROR, "Linear blending requires high-precision FBOs and linear processing.\n");
++        return AVERROR(EINVAL);
++    }
++
+     return 0;
+ 
+ fail:
+@@ -988,7 +1009,8 @@ static int output_frame(AVFilterContext *ctx, int64_t pts)
+     AVFilterLink *outlink = ctx->outputs[0];
+     const AVPixFmtDescriptor *outdesc = av_pix_fmt_desc_get(outlink->format);
+     const double target_pts = TS2T(pts, outlink->time_base);
+-    struct pl_frame target;
++    struct pl_frame target, orig_target = {0};
++    bool output_mapped = false;
+     const AVFrame *ref = NULL;
+     AVFrame *out;
+ 
+@@ -1021,6 +1043,15 @@ static int output_frame(AVFilterContext *ctx, int64_t pts)
+         nb_visible++;
+     }
+ 
++    if (s->require_linear_blend &&
++        (s->disable_linear || s->disable_fbos ||
++         opts->params.disable_linear_scaling || opts->params.disable_fbos ||
++         opts->params.force_low_bit_depth_fbos ||
++         (nb_visible > 1 && !s->linear_tex))) {
++        av_log(ctx, AV_LOG_ERROR, "Linear blending is unavailable.\n");
++        return AVERROR_EXTERNAL;
++    }
++
+     out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+     if (!out)
+         return AVERROR(ENOMEM);
+@@ -1090,9 +1121,12 @@ props_done:
+         goto fail;
+     }
+ 
+-    struct pl_frame orig_target = target;
++    set_hlg_reference(&target.color, s->hlg_reference_peak);
++    orig_target = target;
++    output_mapped = !!(outdesc->flags & AV_PIX_FMT_FLAG_HWACCEL);
+     bool use_linear_compositor = false;
+-    if (s->linear_tex && target.color.transfer != PL_COLOR_TRC_LINEAR &&
++    if (s->linear_tex && (target.color.transfer != PL_COLOR_TRC_LINEAR ||
++                          s->require_linear_blend) &&
+         !s->disable_linear && nb_visible > 1) {
+         target = (struct pl_frame) {
+             .num_planes = 1,
+@@ -1123,7 +1157,13 @@ props_done:
+         }
+         tmp_params.skip_caching_single_frame = high_fps;
+         update_crops(ctx, in, &target, target_pts);
+-        pl_render_image_mix(in->renderer, &in->mix, &target, &tmp_params);
++        ok = pl_render_image_mix(in->renderer, &in->mix, &target, &tmp_params);
++        if (s->require_linear_blend &&
++            (!ok || pl_renderer_get_errors(in->renderer).errors)) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to render a linear composition layer.\n");
++            err = AVERROR_EXTERNAL;
++            goto fail;
++        }
+ 
+         /* Force straight output and set correct blend operator. This is
+          * required to get correct blending onto YUV target buffers. */
+@@ -1140,15 +1180,28 @@ props_done:
+         /* Blit the linear intermediate image to the output frame */
+         target.crop = orig_target.crop = (struct pl_rect2df) {0};
+         target.repr.alpha = PL_ALPHA_PREMULTIPLIED;
+-        pl_render_image(s->linear_rr, &target, &orig_target, &opts->params);
++        ok = pl_render_image(s->linear_rr, &target, &orig_target, &opts->params);
++        if (s->require_linear_blend &&
++            (!ok || pl_renderer_get_errors(s->linear_rr).errors)) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to render the linear composition output.\n");
++            err = AVERROR_EXTERNAL;
++            goto fail;
++        }
+         target = orig_target;
+     } else if (!ref) {
+         /* Render an empty image to clear the frame to the desired fill color */
+-        pl_render_image(s->linear_rr, NULL, &target, &opts->params);
++        ok = pl_render_image(s->linear_rr, NULL, &target, &opts->params);
++        if (s->require_linear_blend &&
++            (!ok || pl_renderer_get_errors(s->linear_rr).errors)) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to clear the composition output.\n");
++            err = AVERROR_EXTERNAL;
++            goto fail;
++        }
+     }
+ 
+     if (outdesc->flags & AV_PIX_FMT_FLAG_HWACCEL) {
+         pl_unmap_avframe(s->gpu, &target);
++        output_mapped = false;
+     } else if (!pl_download_avframe(s->gpu, &target, out)) {
+         err = AVERROR_EXTERNAL;
+         goto fail;
+@@ -1156,6 +1209,8 @@ props_done:
+     return ff_filter_frame(outlink, out);
+ 
+ fail:
++    if (output_mapped)
++        pl_unmap_avframe(s->gpu, &orig_target);
+     av_frame_free(&out);
+     return err;
+ }
+@@ -1171,6 +1226,8 @@ static bool map_frame(pl_gpu gpu, pl_tex *tex,
+         .tex        = tex,
+         .map_dovi   = s->apply_dovi,
+     ));
++    if (ok)
++        set_hlg_reference(&out->color, s->hlg_reference_peak);
+     out->lut = s->lut;
+     out->lut_type = s->lut_type;
+     out->rotation += s->rotation;
+@@ -1504,6 +1561,11 @@ static int libplacebo_config_output(AVFilterLink *outlink)
+         outlink->h = FFMIN(outlink->h, inlink->h);
+     }
+ 
++    if (s->require_linear_blend && s->nb_inputs < 2) {
++        av_log(avctx, AV_LOG_ERROR, "Linear blending requires at least two inputs.\n");
++        return AVERROR(EINVAL);
++    }
++
+     if (s->nb_inputs > 1 && !s->disable_fbos) {
+         /* Create a separate renderer and composition texture */
+         const enum pl_fmt_caps caps = PL_FMT_CAP_BLENDABLE | PL_FMT_CAP_BLITTABLE;
+@@ -1522,6 +1584,10 @@ static int libplacebo_config_output(AVFilterLink *outlink)
+         }
+ 
+         if (!ok) {
++            if (s->require_linear_blend) {
++                av_log(avctx, AV_LOG_ERROR, "Failed to create a linear composition texture.\n");
++                return AVERROR_EXTERNAL;
++            }
+             av_log(avctx, AV_LOG_WARNING, "Failed to create a linear texture "
+                    "for compositing multiple inputs, falling back to non-linear "
+                    "blending.\n");
+@@ -1604,6 +1670,8 @@ fail:
+ 
+ static const AVOption libplacebo_options[] = {
+     { "inputs", "Number of inputs", OFFSET(nb_inputs), AV_OPT_TYPE_INT, {.i64 = 1}, 1, INT_MAX, .flags = STATIC },
++    { "hlg_reference_peak", "HLG reference peak in nits for missing metadata (0 disables)", OFFSET(hlg_reference_peak), AV_OPT_TYPE_FLOAT, {.dbl = 0.0}, 0.0, 10000.0, .flags = STATIC },
++    { "require_linear_blend", "Fail if linear multi-input blending is unavailable", OFFSET(require_linear_blend), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, .flags = STATIC },
+     { "w", "Output video frame width",  OFFSET(w_expr), AV_OPT_TYPE_STRING, {.str = "iw"}, .flags = STATIC },
+     { "h", "Output video frame height", OFFSET(h_expr), AV_OPT_TYPE_STRING, {.str = "ih"}, .flags = STATIC },
+     { "fps", "Output video frame rate", OFFSET(fps_string), AV_OPT_TYPE_STRING, {.str = "none"}, .flags = STATIC },

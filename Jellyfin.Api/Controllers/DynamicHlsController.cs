@@ -1580,7 +1580,7 @@ public class DynamicHlsController : BaseJellyfinApiController
         var videoCodec = _encodingHelper.GetVideoEncoder(state, _encodingOptions);
         var threads = EncodingHelper.GetNumberOfThreads(state, _encodingOptions, videoCodec);
 
-        var mapArgs = state.IsOutputVideo ? _encodingHelper.GetMapArgs(state) : string.Empty;
+        var mapArgs = state.IsOutputVideo ? _encodingHelper.GetMapArgs(state, _encodingOptions) : string.Empty;
 
         var directory = Path.GetDirectoryName(outputPath) ?? throw new ArgumentException($"Provided path ({outputPath}) is not valid.", nameof(outputPath));
         var outputFileNameWithoutExtension = Path.GetFileNameWithoutExtension(outputPath);

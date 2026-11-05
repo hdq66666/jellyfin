@@ -257,6 +257,16 @@ public static class StreamingHelpers
 
         state.OutputFilePath = GetOutputFilePath(state, ext, serverConfigurationManager, streamingRequest.DeviceId, streamingRequest.PlaySessionId);
 
+        try
+        {
+            Av1HdrTranscoding.ValidateTranscode(state, encodingOptions);
+        }
+        catch
+        {
+            state.Dispose();
+            throw;
+        }
+
         return state;
     }
 

@@ -8,6 +8,7 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -1042,6 +1043,244 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             var info = await GetReadableFile(mediaSource, subtitleStream, cancellationToken)
                 .ConfigureAwait(false);
             return info.Path;
+        }
+
+        private string GetHdrPgsSourceFingerprint(string sourcePath, string? concatPath)
+        {
+            if (concatPath is null)
+            {
+                var sourceInfo = _fileSystem.GetFileInfo(sourcePath);
+                if (!sourceInfo.Exists)
+                {
+                    throw new FileNotFoundException("Media source no longer exists.", sourcePath);
+                }
+
+                return FormatCacheMeta(sourceInfo.Length, sourceInfo.LastWriteTimeUtc);
+            }
+
+            if (!Directory.Exists(sourcePath))
+            {
+                throw new DirectoryNotFoundException($"Blu-ray directory no longer exists: {sourcePath}");
+            }
+
+            var text = File.ReadAllText(concatPath);
+            var fingerprint = new StringBuilder().Append(text).Append('\0');
+            var expectingDuration = false;
+            var fileCount = 0;
+            using var reader = new StringReader(text);
+            while (reader.ReadLine() is { } line)
+            {
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                if (expectingDuration)
+                {
+                    if (!line.StartsWith("duration ", StringComparison.Ordinal)
+                        || !double.TryParse(line.AsSpan("duration ".Length), NumberStyles.Float, CultureInfo.InvariantCulture, out var duration)
+                        || !double.IsFinite(duration)
+                        || duration < 0)
+                    {
+                        throw new InvalidDataException("Invalid duration in the Blu-ray concat file.");
+                    }
+
+                    expectingDuration = false;
+                    continue;
+                }
+
+                if (!line.StartsWith("file '", StringComparison.Ordinal) || !line.EndsWith('\''))
+                {
+                    throw new InvalidDataException("Unsupported entry in the Blu-ray concat file.");
+                }
+
+                var escapedPath = line[6..^1];
+                if (escapedPath.Replace("'\\''", string.Empty, StringComparison.Ordinal).Contains('\'', StringComparison.Ordinal))
+                {
+                    throw new InvalidDataException("Invalid quoted path in the Blu-ray concat file.");
+                }
+
+                var segmentPath = escapedPath.Replace("'\\''", "'", StringComparison.Ordinal);
+                if (!Path.IsPathFullyQualified(segmentPath))
+                {
+                    throw new InvalidDataException("Blu-ray concat entries must have absolute paths.");
+                }
+
+                var info = _fileSystem.GetFileInfo(segmentPath);
+                if (!info.Exists)
+                {
+                    throw new FileNotFoundException("Blu-ray concat segment does not exist.", segmentPath);
+                }
+
+                fingerprint.Append(segmentPath.Length.ToString(CultureInfo.InvariantCulture))
+                    .Append(':').Append(segmentPath)
+                    .Append(':').Append(info.Length.ToString(CultureInfo.InvariantCulture))
+                    .Append(':').Append(info.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture))
+                    .Append('\0');
+                fileCount++;
+                expectingDuration = true;
+            }
+
+            if (fileCount == 0 || expectingDuration)
+            {
+                throw new InvalidDataException("The Blu-ray concat file is empty or incomplete.");
+            }
+
+            return "concat-v1:" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(fingerprint.ToString())));
+        }
+
+        private bool IsCachedHdrPgsConcatFresh(string outputPath, string fingerprint)
+        {
+            if (!File.Exists(outputPath) || _fileSystem.GetFileInfo(outputPath).Length == 0)
+            {
+                return false;
+            }
+
+            try
+            {
+                return string.Equals(File.ReadAllText(GetCacheMetaPath(outputPath)), fingerprint, StringComparison.Ordinal);
+            }
+            catch (IOException)
+            {
+                return false;
+            }
+        }
+
+        /// <inheritdoc />
+        public async Task<string> GetHdrPgsSubtitleFilePath(MediaStream subtitleStream, MediaSourceInfo mediaSource, CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(subtitleStream);
+            ArgumentNullException.ThrowIfNull(mediaSource);
+
+            if (subtitleStream.IsExternal || !subtitleStream.IsPgsSubtitleStream)
+            {
+                throw new ArgumentException("An embedded PGS subtitle stream is required.", nameof(subtitleStream));
+            }
+
+            if (mediaSource.Protocol != MediaProtocol.File)
+            {
+                throw new NotSupportedException("HDR PGS subtitle extraction requires a local media source.");
+            }
+
+            ArgumentException.ThrowIfNullOrEmpty(mediaSource.Path);
+            var isBluRayDirectory = mediaSource.VideoType == VideoType.BluRay && Directory.Exists(mediaSource.Path);
+            if (!File.Exists(mediaSource.Path) && !isBluRayDirectory)
+            {
+                throw new FileNotFoundException("Media source does not exist or is not a file.", mediaSource.Path);
+            }
+
+            var streamIndex = EncodingHelper.GetSubtitleStreamIndexForFfmpeg(mediaSource, subtitleStream);
+            if (streamIndex < 0)
+            {
+                throw new ArgumentException("The subtitle stream is not present in the media source.", nameof(subtitleStream));
+            }
+
+            var outputPath = GetSubtitleCachePath(mediaSource, subtitleStream.Index, ".hdr-pgs.sup")
+                ?? throw new ResourceNotFoundException($"MediaSource {mediaSource.Id} has no subtitle cache (non-GUID Id, e.g. Live TV stream).");
+
+            using (await _semaphoreLocks.LockAsync(outputPath, cancellationToken).ConfigureAwait(false))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                string? concatPath = null;
+                if (isBluRayDirectory)
+                {
+                    concatPath = Path.Join(_serverConfigurationManager.CommonApplicationPaths.CachePath, "concat", mediaSource.Id + ".concat");
+                    using (await _semaphoreLocks.LockAsync(concatPath, cancellationToken).ConfigureAwait(false))
+                    {
+                        if (!File.Exists(concatPath))
+                        {
+                            _mediaEncoder.GenerateConcatConfig(mediaSource, concatPath);
+                        }
+                    }
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                var sourceBefore = GetHdrPgsSourceFingerprint(mediaSource.Path, concatPath);
+                if (concatPath is null
+                    ? IsCachedSubtitleFresh(outputPath, mediaSource.Path)
+                    : IsCachedHdrPgsConcatFresh(outputPath, sourceBefore))
+                {
+                    return outputPath;
+                }
+
+                Directory.CreateDirectory(Path.GetDirectoryName(outputPath)
+                    ?? throw new ArgumentException("The subtitle cache path is invalid.", nameof(mediaSource)));
+                var temporaryPath = outputPath + "." + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture) + ".tmp";
+                try
+                {
+                    var inputArgument = concatPath is null
+                        ? "-i " + _mediaEncoder.GetInputPathArgument(mediaSource.Path, mediaSource)
+                        : "-f concat -safe 0 -i \"" + concatPath.EscapeProcessArgument() + "\"";
+                    var args = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "-y -copyts {0} -map 0:{1} -an -vn -c:s copy -avoid_negative_ts disabled -f sup \"{2}\"",
+                        inputArgument,
+                        streamIndex,
+                        temporaryPath.EscapeProcessArgument());
+                    var (exitCode, ffmpegError) = await RunSubtitleExtractionProcess(args, cancellationToken).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (exitCode != 0 || !File.Exists(temporaryPath) || _fileSystem.GetFileInfo(temporaryPath).Length == 0)
+                    {
+                        _logger.LogError("ffmpeg HDR PGS extraction failed for {InputPath} with exit code {ExitCode}: {FfmpegOutput}", mediaSource.Path, exitCode, ffmpegError);
+                        throw new FfmpegException($"ffmpeg HDR PGS extraction failed for {mediaSource.Path}");
+                    }
+
+                    var sourceAfter = GetHdrPgsSourceFingerprint(mediaSource.Path, concatPath);
+                    if (!string.Equals(sourceBefore, sourceAfter, StringComparison.Ordinal))
+                    {
+                        throw new IOException("Media source changed during HDR PGS subtitle extraction.");
+                    }
+
+                    File.Move(temporaryPath, outputPath, true);
+                    try
+                    {
+                        if (concatPath is null)
+                        {
+                            WriteCacheMeta(outputPath, mediaSource.Path);
+                        }
+                        else
+                        {
+                            await File.WriteAllTextAsync(GetCacheMetaPath(outputPath), sourceBefore, cancellationToken).ConfigureAwait(false);
+                        }
+
+                        var sourceFinal = GetHdrPgsSourceFingerprint(mediaSource.Path, concatPath);
+                        if (!string.Equals(sourceBefore, sourceFinal, StringComparison.Ordinal))
+                        {
+                            throw new IOException("Media source changed during HDR PGS subtitle extraction.");
+                        }
+
+                        if (concatPath is null
+                            ? !IsCachedSubtitleFresh(outputPath, mediaSource.Path)
+                            : !IsCachedHdrPgsConcatFresh(outputPath, sourceBefore))
+                        {
+                            throw new IOException("Could not record HDR PGS subtitle cache metadata.");
+                        }
+                    }
+                    catch
+                    {
+                        File.Delete(GetCacheMetaPath(outputPath));
+                        throw;
+                    }
+
+                    return outputPath;
+                }
+                finally
+                {
+                    try
+                    {
+                        File.Delete(temporaryPath);
+                    }
+                    catch (IOException ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to remove temporary HDR PGS subtitle {Path}", temporaryPath);
+                    }
+                    catch (UnauthorizedAccessException ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to remove temporary HDR PGS subtitle {Path}", temporaryPath);
+                    }
+                }
+            }
         }
 
         /// <inheritdoc />

@@ -358,6 +358,11 @@ namespace MediaBrowser.Controller.MediaEncoding
 
         private bool IsHwTonemapAvailable(EncodingJobInfo state, EncodingOptions options)
         {
+            if (Av1HdrTranscoding.GetOutputRange(state, options).HasValue)
+            {
+                return false;
+            }
+
             if (state.VideoStream is null
                 || !options.EnableTonemapping
                 || GetVideoColorBitDepth(state) < 10)
@@ -406,6 +411,11 @@ namespace MediaBrowser.Controller.MediaEncoding
 
         private bool IsIntelVppTonemapAvailable(EncodingJobInfo state, EncodingOptions options)
         {
+            if (Av1HdrTranscoding.GetOutputRange(state, options).HasValue)
+            {
+                return false;
+            }
+
             if (state.VideoStream is null
                 || !options.EnableVppTonemapping
                 || GetVideoColorBitDepth(state) < 10)
@@ -1126,12 +1136,27 @@ namespace MediaBrowser.Controller.MediaEncoding
                     return string.Empty;
                 }
 
-                args.Append(GetQsvDeviceArgs(options.QsvDevice, QsvAlias));
+                var hdrOutput = Av1HdrTranscoding.GetOutputRange(state, options).HasValue;
+                var hdrComposition = hdrOutput && state.SubtitleStream is not null && ShouldEncodeSubtitle(state);
+                if (hdrComposition)
+                {
+                    // Import the VAAPI main picture into libplacebo as DRM PRIME.
+                    // A direct VAAPI -> Vulkan hwmap is not supported on this device.
+                    args.Append(GetDrmDeviceArgs(string.IsNullOrEmpty(options.QsvDevice) ? "/dev/dri/renderD128" : options.QsvDevice, DrmAlias));
+                    args.Append(GetVaapiDeviceArgs(null, "iHD", null, null, DrmAlias, VaapiAlias));
+                    args.Append(" -init_hw_device qsv=" + QsvAlias + "@" + VaapiAlias);
+                    args.Append(GetVulkanDeviceArgs(0, null, VaapiAlias, VulkanAlias));
+                }
+                else
+                {
+                    args.Append(GetQsvDeviceArgs(options.QsvDevice, QsvAlias));
+                }
+
                 var filterDevArgs = GetFilterHwDeviceArgs(QsvAlias);
                 // child device used by qsv.
                 if (_mediaEncoder.SupportsHwaccel("vaapi") || _mediaEncoder.SupportsHwaccel("d3d11va"))
                 {
-                    if (isHwTonemapAvailable && IsOpenclFullSupported())
+                    if (!hdrOutput && isHwTonemapAvailable && IsOpenclFullSupported())
                     {
                         var srcAlias = isLinux ? VaapiAlias : D3d11vaAlias;
                         args.Append(GetOpenclDeviceArgs(0, null, srcAlias, OpenclAlias));
@@ -1142,7 +1167,7 @@ namespace MediaBrowser.Controller.MediaEncoding
                     }
                 }
 
-                args.Append(filterDevArgs);
+                args.Append(hdrComposition ? GetFilterHwDeviceArgs(VulkanAlias) : filterDevArgs);
             }
             else if (optHwaccelType == HardwareAccelerationType.nvenc)
             {
@@ -1282,7 +1307,12 @@ namespace MediaBrowser.Controller.MediaEncoding
                     .Append(_mediaEncoder.GetInputPathArgument(state));
             }
 
-            if (NeedsExternalSubtitleMuxing(state))
+            var hdrPgsInput = GetHdrPgsInputArgument(state, options);
+            if (!string.IsNullOrEmpty(hdrPgsInput))
+            {
+                arg.Append(hdrPgsInput);
+            }
+            else if (NeedsExternalSubtitleMuxing(state))
             {
                 var subtitlePath = state.SubtitleStream.Path;
                 var isGraphicalBurnIn = ShouldEncodeSubtitle(state) && !state.SubtitleStream.IsTextSubtitleStream;
@@ -1347,6 +1377,30 @@ namespace MediaBrowser.Controller.MediaEncoding
             }
 
             return arg.ToString();
+        }
+
+        internal bool UsesHdrPgsCache(EncodingJobInfo state, EncodingOptions options)
+            => Av1HdrTranscoding.GetOutputRange(state, options).HasValue
+                && state.SubtitleStream is { IsExternal: false } subtitle
+                && MediaStream.IsPgsFormat(subtitle.Codec)
+                && ShouldEncodeSubtitle(state);
+
+        internal string GetHdrPgsInputArgument(EncodingJobInfo state, EncodingOptions options)
+        {
+            if (!UsesHdrPgsCache(state, options))
+            {
+                return string.Empty;
+            }
+
+            var path = _subtitleEncoder.GetHdrPgsSubtitleFilePath(state.SubtitleStream, state.MediaSource, CancellationToken.None)
+                .GetAwaiter().GetResult();
+            ArgumentException.ThrowIfNullOrEmpty(path);
+
+            // Read the small, absolute-timestamp cache from the beginning to retain a
+            // cue/epoch spanning a seek. isync aligns both source start times and the
+            // main input's seek offset without seeking away subtitle decoder state.
+            return " -start_at_zero -isync 0" + GetGraphicalSubCanvasSize(state)
+                + " -i file:\"" + path.EscapeProcessArgument() + "\"";
         }
 
         /// <summary>
@@ -1939,18 +1993,24 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// <param name="state">The state.</param>
         /// <param name="enableAlpha">Enable alpha processing.</param>
         /// <param name="enableSub2video">Enable sub2video mode.</param>
+        /// <param name="preserveFrameTimestamps">Leave timestamp adjustment to the caller.</param>
+        /// <param name="keepEmptyFrames">Keep every transparent canvas frame in sub2video mode.</param>
         /// <returns>System.String.</returns>
-        public string GetTextSubtitlesFilter(EncodingJobInfo state, bool enableAlpha, bool enableSub2video)
+        public string GetTextSubtitlesFilter(EncodingJobInfo state, bool enableAlpha, bool enableSub2video, bool preserveFrameTimestamps = false, bool keepEmptyFrames = false)
         {
             var seconds = Math.Round(TimeSpan.FromTicks(state.StartTimeTicks ?? 0).TotalSeconds);
 
             // hls always copies timestamps
-            var setPtsParam = state.CopyTimestamps || state.TranscodingType != TranscodingJobType.Progressive
+            var setPtsParam = preserveFrameTimestamps || state.CopyTimestamps || state.TranscodingType != TranscodingJobType.Progressive
                 ? string.Empty
                 : string.Format(CultureInfo.InvariantCulture, ",setpts=PTS -{0}/TB", seconds);
 
             var alphaParam = enableAlpha ? ":alpha=1" : string.Empty;
             var sub2videoParam = enableSub2video ? ":sub2video=1" : string.Empty;
+            if (enableSub2video && keepEmptyFrames)
+            {
+                sub2videoParam += ":sub2video_skip=0";
+            }
 
             var fontPath = _pathManager.GetAttachmentFolderPath(state.MediaSource.Id);
             var fontParam = fontPath is null
@@ -2115,6 +2175,8 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// <returns>Video bitrate.</returns>
         public string GetVideoQualityParam(EncodingJobInfo state, string videoEncoder, EncodingOptions encodingOptions, EncoderPreset defaultPreset)
         {
+            Av1HdrTranscoding.ValidateTranscode(state, encodingOptions);
+            var hdrRange = Av1HdrTranscoding.GetOutputRange(state, encodingOptions);
             var param = string.Empty;
 
             // Tutorials: Enable Intel GuC / HuC firmware loading for Low Power Encoding.
@@ -2194,7 +2256,20 @@ namespace MediaBrowser.Controller.MediaEncoding
             var encodingPreset = encodingOptions.EncoderPreset;
 
             param += GetEncoderParam(encodingPreset, defaultPreset, encodingOptions, videoEncoder, isLibX265);
-            param += GetVideoBitrateParam(state, videoEncoder);
+            if (hdrRange.HasValue)
+            {
+                // AV1 Main-tier level 5.3 permits a one-second 60 Mbit buffer.
+                // Keep the existing rate-control tuning on the SDR path.
+                var bitrate = state.OutputVideoBitrate!.Value;
+                var maxrate = Math.Min((long)bitrate + 1, 60000000);
+                var buffer = Math.Min((long)bitrate * 4, 60000000);
+                var initial = Math.Min((long)bitrate * 2, buffer);
+                param += FormattableString.Invariant($" -b:v {bitrate} -maxrate {maxrate} -rc_init_occupancy {initial} -bufsize {buffer}");
+            }
+            else
+            {
+                param += GetVideoBitrateParam(state, videoEncoder);
+            }
 
             var framerate = GetFramerateParam(state);
             if (framerate.HasValue)
@@ -2211,6 +2286,10 @@ namespace MediaBrowser.Controller.MediaEncoding
 
             var profile = state.GetRequestedProfiles(targetVideoCodec).FirstOrDefault() ?? string.Empty;
             profile = WhiteSpaceRegex().Replace(profile, string.Empty).ToLowerInvariant();
+            if (hdrRange.HasValue)
+            {
+                profile = "main";
+            }
 
             var videoProfiles = Array.Empty<string>();
             if (string.Equals("h264", targetVideoCodec, StringComparison.OrdinalIgnoreCase))
@@ -2322,7 +2401,9 @@ namespace MediaBrowser.Controller.MediaEncoding
                 }
             }
 
-            var level = NormalizeTranscodingLevel(state, state.GetRequestedLevel(targetVideoCodec));
+            var level = hdrRange.HasValue
+                ? Av1HdrTranscoding.GetOutputLevel(state).ToString(CultureInfo.InvariantCulture)
+                : NormalizeTranscodingLevel(state, state.GetRequestedLevel(targetVideoCodec));
 
             if (!string.IsNullOrEmpty(level))
             {
@@ -2410,6 +2491,13 @@ namespace MediaBrowser.Controller.MediaEncoding
                 && _mediaEncoder.EncoderVersion >= _minFFmpegSvtAv1Params)
             {
                 param += " -svtav1-params:0 rc=1:tune=0:film-grain=0:enable-overlays=1:enable-tf=0";
+            }
+
+            if (hdrRange.HasValue)
+            {
+                param += " -color_primaries:v:0 bt2020 -colorspace:v:0 bt2020nc -color_range:v:0 tv"
+                    + " -color_trc:v:0 " + Av1HdrTranscoding.GetTransfer(hdrRange.Value)
+                    + " -bsf:v:0 av1_metadata=remove_dovi=1:remove_hdr10plus=1:chroma_sample_position=0";
             }
 
             /* Access unit too large: 8192 < 20880 error */
@@ -3127,6 +3215,13 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// <param name="state">The state.</param>
         /// <returns>System.String.</returns>
         public string GetMapArgs(EncodingJobInfo state)
+            => GetMapArgs(state, null);
+
+        /// <summary>Gets stream maps, including any dedicated HDR subtitle input.</summary>
+        /// <param name="state">The encoding state.</param>
+        /// <param name="options">The encoding configuration, or null for the original mapping behavior.</param>
+        /// <returns>The stream mapping arguments.</returns>
+        public string GetMapArgs(EncodingJobInfo state, EncodingOptions options)
         {
             // If we don't have known media info
             // If input is video, use -sn to drop subtitles
@@ -3170,7 +3265,8 @@ namespace MediaBrowser.Controller.MediaEncoding
                 int audioStreamIndex = FindIndex(state.MediaSource.MediaStreams, state.AudioStream);
                 if (state.AudioStream.IsExternal)
                 {
-                    bool hasExternalSubAsInput = NeedsExternalSubtitleMuxing(state);
+                    bool hasExternalSubAsInput = NeedsExternalSubtitleMuxing(state)
+                        || (options is not null && UsesHdrPgsCache(state, options));
                     int externalAudioMapIndex = hasExternalSubAsInput ? 2 : 1;
 
                     args += string.Format(
@@ -4475,6 +4571,13 @@ namespace MediaBrowser.Controller.MediaEncoding
                 return (null, null, null);
             }
 
+            Av1HdrTranscoding.ValidateTranscode(state, options);
+            var hdrRange = Av1HdrTranscoding.GetOutputRange(state, options);
+            if (hdrRange.HasValue)
+            {
+                return GetQsvAv1HdrFilters(state, options, GetHardwareVideoDecoder(state, options) ?? string.Empty, vidEncoder, hdrRange.Value);
+            }
+
             var isWindows = OperatingSystem.IsWindows();
             var isLinux = OperatingSystem.IsLinux();
             var vidDecoder = GetHardwareVideoDecoder(state, options) ?? string.Empty;
@@ -4509,6 +4612,148 @@ namespace MediaBrowser.Controller.MediaEncoding
             }
 
             return (null, null, null);
+        }
+
+        /// <summary>
+        /// Builds the Wildcat Lake AV1 HDR pipeline with linear-light GPU subtitle composition.
+        /// </summary>
+        /// <param name="state">The encoding job.</param>
+        /// <param name="options">The encoding configuration.</param>
+        /// <param name="vidDecoder">The selected hardware decoder.</param>
+        /// <param name="vidEncoder">The selected hardware encoder.</param>
+        /// <param name="range">The output HDR range.</param>
+        /// <returns>The main, subtitle and composition filter chains.</returns>
+        public (List<string> MainFilters, List<string> SubFilters, List<string> OverlayFilters) GetQsvAv1HdrFilters(
+            EncodingJobInfo state,
+            EncodingOptions options,
+            string vidDecoder,
+            string vidEncoder,
+            VideoRangeType range)
+        {
+            if (!vidDecoder.Contains("vaapi", StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(vidEncoder, "av1_qsv", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new NotSupportedException("AV1 HDR on this fork requires native VAAPI decoding and av1_qsv encoding.");
+            }
+
+            var video = state.VideoStream;
+            var request = state.BaseRequest;
+            var rotation = video.Rotation ?? 0;
+            var transpose = rotation == 0 ? string.Empty : GetVideoTransposeDirection(state);
+            var swap = Math.Abs(rotation) == 90 && !string.IsNullOrEmpty(transpose);
+            var width = swap ? video.Height : video.Width;
+            var height = swap ? video.Width : video.Height;
+            var main = new List<string> { GetInputHdrParam(Av1HdrTranscoding.GetTransfer(range)) };
+            var subs = new List<string>();
+            var overlay = new List<string>();
+
+            if (IsDeinterlaceAvailable(state))
+            {
+                main.Add(GetHwDeinterlaceFilter(state, options, "vaapi"));
+            }
+
+            if (!string.IsNullOrEmpty(transpose))
+            {
+                main.Add("transpose_vaapi=dir=" + transpose);
+            }
+
+            // Sample before splitting the subtitle clock so both inputs have identical PTS.
+            if (GetFramerateParam(state) is { } framerate)
+            {
+                main.Add(FormattableString.Invariant($"fps={framerate}"));
+            }
+
+            var scale = GetHwScaleFilter(
+                "scale",
+                "vaapi",
+                "p010le",
+                false,
+                width,
+                height,
+                request.Width,
+                request.Height,
+                request.MaxWidth,
+                request.MaxHeight);
+            main.Add(scale + ":out_range=tv:extra_hw_frames=24");
+
+            if (state.SubtitleStream is null || !ShouldEncodeSubtitle(state))
+            {
+                main.Add("hwmap=derive_device=qsv");
+                main.Add("format=qsv");
+                return (main, subs, overlay);
+            }
+
+            if (!_mediaEncoder.SupportsFilter("libplacebo") || !_mediaEncoder.SupportsHwaccel("vulkan")
+                || !_mediaEncoder.SupportsFilterWithOption(FilterOptionType.LibplaceboRequireLinearBlend)
+                || (range == VideoRangeType.HLG && !_mediaEncoder.SupportsFilterWithOption(FilterOptionType.LibplaceboHlgReferencePeak)))
+            {
+                throw new NotSupportedException("HDR subtitle composition requires the patched libplacebo Vulkan filter.");
+            }
+
+            var (outWidth, outHeight) = GetFixedOutputSize(width, height, request.Width, request.Height, request.MaxWidth, request.MaxHeight);
+            // Keep subtitle heartbeats just before a clear event distinct from the
+            // clear itself. A coarse video time base can round both to the same tick.
+            // Retiming before the split also keeps both libplacebo inputs identical.
+            main.Add("settb=AVTB");
+            // Derive a transparent canvas from every main frame. An independent alphasrc
+            // can add PTS or keep libplacebo alive after the video ends. Only this tiny
+            // timing image leaves the GPU; the main picture remains in GPU memory.
+            main.Add("split=2[av1hdr_video][av1hdr_clock];[av1hdr_clock]"
+                + "scale_vaapi=w=16:h=16:format=nv12,hwdownload,format=nv12,"
+                + FormattableString.Invariant($"scale=w={outWidth}:h={outHeight}:flags=neighbor,")
+                + "format=bgra,lutrgb=r=0:g=0:b=0:a=0,sidedata=mode=delete"
+                + "[av1hdr_canvas];[av1hdr_video]hwmap=derive_device=drm:mode=read+direct");
+            main.Add("format=drm_prime");
+
+            if (state.SubtitleStream.IsTextSubtitleStream)
+            {
+                if (!_mediaEncoder.SupportsFilterWithOption(FilterOptionType.SubtitlesSub2videoSkip))
+                {
+                    throw new NotSupportedException("HDR text subtitles require sub2video_skip support to retain the video clock.");
+                }
+
+                // Jellyfin FFmpeg's sub2video patch emits straight packed BGRA.
+                // Progressive input seeking resets PTS. Render at the original program
+                // time, then restore the main clock, retaining fractional seek positions.
+                var subtitleClockOffset = !state.CopyTimestamps && state.TranscodingType == TranscodingJobType.Progressive
+                    ? TimeSpan.FromTicks(state.StartTimeTicks ?? 0).TotalSeconds
+                    : 0;
+                var subtitleFilter = GetTextSubtitlesFilter(state, true, true, preserveFrameTimestamps: true, keepEmptyFrames: true);
+                if (subtitleClockOffset != 0)
+                {
+                    subtitleFilter = FormattableString.Invariant($"setpts=PTS+{subtitleClockOffset}/TB,")
+                        + subtitleFilter + FormattableString.Invariant($",setpts=PTS-{subtitleClockOffset}/TB");
+                }
+
+                subs.Add("[av1hdr_canvas]setparams=alpha_mode=straight," + subtitleFilter);
+            }
+            else
+            {
+                subs.Add(GetGraphicalSubPreProcessFilters(
+                    width,
+                    height,
+                    state.SubtitleStream.Width,
+                    state.SubtitleStream.Height,
+                    request.Width,
+                    request.Height,
+                    request.MaxWidth,
+                    request.MaxHeight));
+                subs.Add("format=bgra[av1hdr_pgs];[av1hdr_canvas][av1hdr_pgs]"
+                    + "overlay=eof_action=pass:repeatlast=0:format=rgb:alpha=straight");
+            }
+
+            subs.Add("format=bgra");
+            subs.Add("sidedata=mode=delete");
+            subs.Add("setparams=colorspace=gbr:color_primaries=bt709:color_trc=bt709:range=pc:alpha_mode=straight");
+            overlay.Add(Av1HdrTranscoding.GetSubtitleCompositionFilter(range));
+            // Force a hardware output: without format=vulkan, negotiation can download
+            // P010 before hwmap and select an invalid reverse software mapping.
+            overlay.Add("format=vulkan");
+            overlay.Add("hwmap=derive_device=vaapi:mode=read+direct");
+            overlay.Add("format=vaapi");
+            overlay.Add("hwmap=derive_device=qsv");
+            overlay.Add("format=qsv");
+            return (main, subs, overlay);
         }
 
         public (List<string> MainFilters, List<string> SubFilters, List<string> OverlayFilters) GetIntelQsvDx11VidFiltersPrefered(
@@ -6312,10 +6557,6 @@ namespace MediaBrowser.Controller.MediaEncoding
                 return string.Empty;
             }
 
-            var hasSubs = state.SubtitleStream is not null && ShouldEncodeSubtitle(state);
-            var hasTextSubs = hasSubs && state.SubtitleStream.IsTextSubtitleStream;
-            var hasGraphicalSubs = hasSubs && !state.SubtitleStream.IsTextSubtitleStream;
-
             List<string> mainFilters;
             List<string> subFilters;
             List<string> overlayFilters;
@@ -6336,7 +6577,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             overlayFilters?.RemoveAll(string.IsNullOrEmpty);
 
             var framerate = GetFramerateParam(state);
-            if (mainFilters is not null && framerate.HasValue)
+            if (mainFilters is not null && framerate.HasValue && !Av1HdrTranscoding.GetOutputRange(state, options).HasValue)
             {
                 var doDeintH2645 = IsDeinterlaceAvailable(state);
                 var fpsFilter = string.Format(CultureInfo.InvariantCulture, "fps={0}", framerate.Value);
@@ -6353,6 +6594,18 @@ namespace MediaBrowser.Controller.MediaEncoding
                 }
             }
 
+            return FormatVideoFilterGraph(state, mainFilters, subFilters, overlayFilters, UsesHdrPgsCache(state, options));
+        }
+
+        internal string FormatVideoFilterGraph(
+            EncodingJobInfo state,
+            List<string> mainFilters,
+            List<string> subFilters,
+            List<string> overlayFilters,
+            bool useHdrPgsCache = false)
+        {
+            var hasSubs = state.SubtitleStream is not null && ShouldEncodeSubtitle(state);
+            var hasTextSubs = hasSubs && state.SubtitleStream.IsTextSubtitleStream;
             var mainStr = string.Empty;
             if (mainFilters?.Count > 0)
             {
@@ -6383,8 +6636,8 @@ namespace MediaBrowser.Controller.MediaEncoding
                         "{0}",
                         string.Join(',', overlayFilters));
 
-                var mapPrefix = Convert.ToInt32(state.SubtitleStream.IsExternal);
-                var subtitleStreamIndex = GetSubtitleStreamIndexForFfmpeg(state.MediaSource, state.SubtitleStream);
+                var mapPrefix = useHdrPgsCache ? 1 : Convert.ToInt32(state.SubtitleStream.IsExternal);
+                var subtitleStreamIndex = useHdrPgsCache ? 0 : GetSubtitleStreamIndexForFfmpeg(state.MediaSource, state.SubtitleStream);
                 var videoStreamIndex = FindIndex(state.MediaSource.MediaStreams, state.VideoStream);
 
                 if (hasSubs)
@@ -6828,8 +7081,10 @@ namespace MediaBrowser.Controller.MediaEncoding
             var isIntelVaapiOclSupported = isLinux
                 && IsVaapiSupported(state)
                 && isQsvOclSupported;
-            var hwSurface = (isIntelDx11OclSupported || isIntelVaapiOclSupported)
-                && _mediaEncoder.SupportsFilter("alphasrc");
+            var hdrSurface = isLinux && IsVaapiSupported(state)
+                && Av1HdrTranscoding.GetOutputRange(state, options).HasValue;
+            var hwSurface = hdrSurface || ((isIntelDx11OclSupported || isIntelVaapiOclSupported)
+                && _mediaEncoder.SupportsFilter("alphasrc"));
 
             var is8bitSwFormatsQsv = string.Equals("yuv420p", videoStream.PixelFormat, StringComparison.OrdinalIgnoreCase)
                                      || string.Equals("yuvj420p", videoStream.PixelFormat, StringComparison.OrdinalIgnoreCase);
@@ -7742,7 +7997,7 @@ namespace MediaBrowser.Controller.MediaEncoding
                 inputModifier,
                 GetInputArgument(state, encodingOptions, null),
                 keyFrame,
-                GetMapArgs(state),
+                GetMapArgs(state, encodingOptions),
                 GetProgressiveVideoArguments(state, encodingOptions, videoCodec, defaultPreset),
                 threads,
                 GetProgressiveVideoAudioArguments(state, encodingOptions),

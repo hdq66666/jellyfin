@@ -1,0 +1,30 @@
+diff --git a/libavfilter/vf_subtitles.c b/libavfilter/vf_subtitles.c
+index 16b13fe..d5aa6ad 100644
+--- a/libavfilter/vf_subtitles.c
++++ b/libavfilter/vf_subtitles.c
+@@ -66,6 +66,7 @@ typedef struct AssContext {
+     FFDrawContext draw;
+     int wrap_unicode;
+     int sub2video;
++    int sub2video_skip;
+     int last_image;
+     int64_t max_pts, max_ts_ms;
+ } AssContext;
+@@ -80,6 +81,7 @@ typedef struct AssContext {
+     {"fontsdir",       "set the directory containing the fonts to read",           OFFSET(fontsdir),   AV_OPT_TYPE_STRING,     {.str = NULL},  0, 0, FLAGS }, \
+     {"alpha",          "enable processing of alpha channel",                       OFFSET(alpha),      AV_OPT_TYPE_BOOL,       {.i64 = 0   },  0, 1, FLAGS }, \
+     {"sub2video",      "enable textual subtitle to video mode",                    OFFSET(sub2video),  AV_OPT_TYPE_BOOL,       {.i64 = 0   },  0, 1, FLAGS }, \
++    {"sub2video_skip", "skip repeated blank frames in sub2video mode",             OFFSET(sub2video_skip), AV_OPT_TYPE_BOOL,    {.i64 = 1   },  0, 1, FLAGS }, \
+     {"shaping",        "set shaping engine",                                       OFFSET(shaping),    AV_OPT_TYPE_INT,        {.i64 = ASS_SHAPING_COMPLEX }, -1, 1, FLAGS, .unit = "shaping_mode"}, \
+         {"auto",       NULL,              0, AV_OPT_TYPE_CONST, {.i64 = -1},                  INT_MIN, INT_MAX, FLAGS, .unit = "shaping_mode"}, \
+         {"simple",     "simple shaping",  0, AV_OPT_TYPE_CONST, {.i64 = ASS_SHAPING_SIMPLE},  INT_MIN, INT_MAX, FLAGS, .unit = "shaping_mode"}, \
+@@ -269,7 +271,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+                                         time_ms, &detect_change);
+ 
+     if (ass->sub2video) {
+-        if (!image && !ass->last_image && picref->pts <= ass->max_pts && outl->current_pts != AV_NOPTS_VALUE) {
++        if (ass->sub2video_skip && !image && !ass->last_image &&
++            picref->pts <= ass->max_pts && outl->current_pts != AV_NOPTS_VALUE) {
+             av_log(ctx, AV_LOG_DEBUG, "sub2video skip pts:%"PRId64"\n", picref->pts);
+             av_frame_free(&picref);
+             return 0;
