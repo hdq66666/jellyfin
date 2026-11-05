@@ -1,6 +1,7 @@
 using System;
 using System.Globalization;
 using System.Text;
+using Jellyfin.Data.Enums;
 
 namespace Jellyfin.Api.Helpers;
 
@@ -298,6 +299,18 @@ public static class HlsCodecStringHelpers
     /// <param name="bitDepth">AV1 bit depth.</param>
     /// <returns>The AV1 codec string.</returns>
     public static string GetAv1String(string? profile, int level, bool tierFlag, int bitDepth)
+        => GetAv1String(profile, level, tierFlag, bitDepth, null);
+
+    /// <summary>
+    /// Gets an AV1 codec string, including the QSV HDR color fields when applicable.
+    /// </summary>
+    /// <param name="profile">AV1 profile.</param>
+    /// <param name="level">AV1 level.</param>
+    /// <param name="tierFlag">AV1 tier flag.</param>
+    /// <param name="bitDepth">AV1 bit depth.</param>
+    /// <param name="hdrRange">HDR range for a QSV HDR transcode, if applicable.</param>
+    /// <returns>The AV1 codec string.</returns>
+    public static string GetAv1String(string? profile, int level, bool tierFlag, int bitDepth, VideoRangeType? hdrRange)
     {
         // https://aomediacodec.github.io/av1-isobmff/#codecsparam
         // FORMAT: [codecTag].[profile].[level][tier].[bitDepth]
@@ -321,7 +334,7 @@ public static class HlsCodecStringHelpers
             result.Append(".0");
         }
 
-        if (level is <= 0 or > 31)
+        if (level < (hdrRange.HasValue ? 0 : 1) || level > 31)
         {
             // Default to the maximum defined level 6.3
             level = 19;
@@ -343,6 +356,14 @@ public static class HlsCodecStringHelpers
         string bitDepthD2 = bitDepth.ToString("D2", CultureInfo.InvariantCulture);
         result.Append('.')
             .Append(bitDepthD2);
+
+        if (hdrRange is VideoRangeType.HDR10 or VideoRangeType.HLG)
+        {
+            // QSV emits 4:2:0 with unknown chroma sample position and limited range.
+            result.Append(".0.110.09.")
+                .Append(hdrRange == VideoRangeType.HLG ? "18" : "16")
+                .Append(".09.0");
+        }
 
         return result.ToString();
     }

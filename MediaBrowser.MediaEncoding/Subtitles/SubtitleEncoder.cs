@@ -1045,6 +1045,117 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         }
 
         /// <inheritdoc />
+        public async Task<string> GetHdrPgsSubtitleFilePath(MediaStream subtitleStream, MediaSourceInfo mediaSource, CancellationToken cancellationToken)
+        {
+            ArgumentNullException.ThrowIfNull(subtitleStream);
+            ArgumentNullException.ThrowIfNull(mediaSource);
+
+            if (subtitleStream.IsExternal || !subtitleStream.IsPgsSubtitleStream)
+            {
+                throw new ArgumentException("An embedded PGS subtitle stream is required.", nameof(subtitleStream));
+            }
+
+            if (mediaSource.Protocol != MediaProtocol.File)
+            {
+                throw new NotSupportedException("HDR PGS subtitle extraction requires a local media source.");
+            }
+
+            ArgumentException.ThrowIfNullOrEmpty(mediaSource.Path);
+            if (!File.Exists(mediaSource.Path))
+            {
+                throw new FileNotFoundException("Media source does not exist or is not a file.", mediaSource.Path);
+            }
+
+            var streamIndex = EncodingHelper.GetSubtitleStreamIndexForFfmpeg(mediaSource, subtitleStream);
+            if (streamIndex < 0)
+            {
+                throw new ArgumentException("The subtitle stream is not present in the media source.", nameof(subtitleStream));
+            }
+
+            var outputPath = GetSubtitleCachePath(mediaSource, subtitleStream.Index, ".hdr-pgs.sup")
+                ?? throw new ResourceNotFoundException($"MediaSource {mediaSource.Id} has no subtitle cache (non-GUID Id, e.g. Live TV stream).");
+
+            using (await _semaphoreLocks.LockAsync(outputPath, cancellationToken).ConfigureAwait(false))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!File.Exists(mediaSource.Path))
+                {
+                    throw new FileNotFoundException("Media source no longer exists or is not a file.", mediaSource.Path);
+                }
+
+                if (IsCachedSubtitleFresh(outputPath, mediaSource.Path))
+                {
+                    return outputPath;
+                }
+
+                var sourceBefore = _fileSystem.GetFileInfo(mediaSource.Path);
+                if (!sourceBefore.Exists)
+                {
+                    throw new FileNotFoundException("Media source no longer exists.", mediaSource.Path);
+                }
+
+                Directory.CreateDirectory(Path.GetDirectoryName(outputPath)
+                    ?? throw new ArgumentException("The subtitle cache path is invalid.", nameof(mediaSource)));
+                var temporaryPath = outputPath + "." + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture) + ".tmp";
+                try
+                {
+                    var inputPath = _mediaEncoder.GetInputPathArgument(mediaSource.Path, mediaSource);
+                    var args = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "-y -copyts -i {0} -map 0:{1} -an -vn -c:s copy -avoid_negative_ts disabled -f sup \"{2}\"",
+                        inputPath,
+                        streamIndex,
+                        temporaryPath.EscapeProcessArgument());
+                    var (exitCode, ffmpegError) = await RunSubtitleExtractionProcess(args, cancellationToken).ConfigureAwait(false);
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    if (exitCode != 0 || !File.Exists(temporaryPath) || _fileSystem.GetFileInfo(temporaryPath).Length == 0)
+                    {
+                        _logger.LogError("ffmpeg HDR PGS extraction failed for {InputPath} with exit code {ExitCode}: {FfmpegOutput}", inputPath, exitCode, ffmpegError);
+                        throw new FfmpegException($"ffmpeg HDR PGS extraction failed for {mediaSource.Path}");
+                    }
+
+                    var sourceAfter = _fileSystem.GetFileInfo(mediaSource.Path);
+                    if (!sourceAfter.Exists || sourceBefore.Length != sourceAfter.Length || sourceBefore.LastWriteTimeUtc != sourceAfter.LastWriteTimeUtc)
+                    {
+                        throw new IOException("Media source changed during HDR PGS subtitle extraction.");
+                    }
+
+                    File.Move(temporaryPath, outputPath, true);
+                    WriteCacheMeta(outputPath, mediaSource.Path);
+                    var sourceFinal = _fileSystem.GetFileInfo(mediaSource.Path);
+                    if (!sourceFinal.Exists || sourceBefore.Length != sourceFinal.Length || sourceBefore.LastWriteTimeUtc != sourceFinal.LastWriteTimeUtc)
+                    {
+                        File.Delete(GetCacheMetaPath(outputPath));
+                        throw new IOException("Media source changed during HDR PGS subtitle extraction.");
+                    }
+
+                    if (!IsCachedSubtitleFresh(outputPath, mediaSource.Path))
+                    {
+                        throw new IOException("Could not record HDR PGS subtitle cache metadata.");
+                    }
+
+                    return outputPath;
+                }
+                finally
+                {
+                    try
+                    {
+                        File.Delete(temporaryPath);
+                    }
+                    catch (IOException ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to remove temporary HDR PGS subtitle {Path}", temporaryPath);
+                    }
+                    catch (UnauthorizedAccessException ex)
+                    {
+                        _logger.LogWarning(ex, "Failed to remove temporary HDR PGS subtitle {Path}", temporaryPath);
+                    }
+                }
+            }
+        }
+
+        /// <inheritdoc />
         public void Dispose()
         {
             _semaphoreLocks.Dispose();

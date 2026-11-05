@@ -55,6 +55,15 @@ namespace MediaBrowser.Controller.MediaEncoding
         Task<string> GetSubtitleFilePath(MediaStream subtitleStream, MediaSourceInfo mediaSource, CancellationToken cancellationToken);
 
         /// <summary>
+        /// Gets a cached copy of an embedded PGS subtitle with its original timestamps.
+        /// </summary>
+        /// <param name="subtitleStream">The embedded PGS subtitle stream.</param>
+        /// <param name="mediaSource">The source media.</param>
+        /// <param name="cancellationToken">The cancellation token for the operation.</param>
+        /// <returns>The absolute path of the cached subtitle.</returns>
+        Task<string> GetHdrPgsSubtitleFilePath(MediaStream subtitleStream, MediaSourceInfo mediaSource, CancellationToken cancellationToken);
+
+        /// <summary>
         /// Extracts all extractable subtitles (text and pgs).
         /// </summary>
         /// <param name="mediaSource">The mediaSource.</param>

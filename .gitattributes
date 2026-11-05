@@ -3,3 +3,6 @@
 *.jpg binary
 
 CONTRIBUTORS.md merge=union
+
+# Unified diff context lines include a trailing prefix on blank lines.
+patches/ffmpeg/*.patch -whitespace

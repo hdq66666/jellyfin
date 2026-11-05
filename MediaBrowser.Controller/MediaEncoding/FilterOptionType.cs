@@ -48,6 +48,15 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// <summary>
         /// The overlay_cuda_alpha_format.
         /// </summary>
-        OverlayCudaAlphaFormat = 8
+        OverlayCudaAlphaFormat = 8,
+
+        /// <summary>Strict linear-light multi-input libplacebo composition.</summary>
+        LibplaceboRequireLinearBlend = 9,
+
+        /// <summary>Explicit HLG reference display for missing luminance metadata.</summary>
+        LibplaceboHlgReferencePeak = 10,
+
+        /// <summary>Keep transparent frames in the sub2video subtitle renderer.</summary>
+        SubtitlesSub2videoSkip = 11
     }
 }
