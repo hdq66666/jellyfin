@@ -12,7 +12,10 @@ encoding, native hardware decoding and the source codec's 10-bit decoder.
 An eligible HDR-to-AV1 request produces Main-profile, 10-bit, limited-range
 BT.2020 AV1 with the source's PQ or HLG transfer. It never requests HDR-to-SDR
 tone mapping or VPP brightness adjustment. Source bit depth, chroma format,
-range, matrix, primaries and compatible HDR base layer must be known. An
+range, matrix, primaries and compatible HDR base layer must be known. The color
+range is persisted with the other video color properties. A nullable database
+migration preserves existing rows; refresh media information after upgrading
+to populate this field from a real probe rather than assuming limited range. An
 unsupported explicit HDR transcode fails; an unavailable optional HLS transcode
 variant is omitted without breaking original copy/remux playback.
 
@@ -139,7 +142,9 @@ The current 4K subtitle compositor did not reach real-time 24 fps. No automatic
 resolution reduction is applied. The 90-second sparse-text test completed with
 2160 frames and approximately 108 MiB peak process RSS.
 
-The dedicated PGS cache currently supports local files. The cache container's
+The dedicated PGS cache supports local files and Blu-ray directories. Directory
+extraction uses the same concat manifest as video playback; cache freshness
+includes the manifest and each referenced segment's size and modification time. The cache container's
 32-bit 90 kHz timestamps and FFmpeg's requirement for known input start times
 remain format limits; extreme absolute timestamps and missing start times are
 not covered by the target validation. Cache extraction from ISO uses the

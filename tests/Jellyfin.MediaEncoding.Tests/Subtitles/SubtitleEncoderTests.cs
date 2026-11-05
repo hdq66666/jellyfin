@@ -10,6 +10,7 @@ using System.Threading.Tasks;
 using AutoFixture;
 using AutoFixture.AutoMoq;
 using MediaBrowser.Common;
+using MediaBrowser.Common.Configuration;
 using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.IO;
 using MediaBrowser.Controller.Library;
@@ -425,7 +426,204 @@ namespace Jellyfin.MediaEncoding.Subtitles.Tests
             fixture.Source.Protocol = MediaProtocol.File;
             fixture.Source.MediaStreams = [];
             await Assert.ThrowsAsync<ArgumentException>(() => fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token));
+            fixture.Source.MediaStreams = [fixture.Stream];
+            fixture.Source.Path = fixture.DirectoryPath;
+            fixture.Source.VideoType = VideoType.Dvd;
+            await Assert.ThrowsAsync<FileNotFoundException>(() => fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token));
             Assert.False(File.Exists(fixture.LogPath));
+        }
+
+        [Fact]
+        public async Task GetHdrPgsSubtitleFilePath_BluRayConcatTracksSegmentsAndManifest()
+        {
+            Assert.SkipWhen(OperatingSystem.IsWindows(), "The extraction process test uses a Unix shell.");
+            using var fixture = new HdrPgsFixture("pgssub");
+            var token = TestContext.Current.CancellationToken;
+            var disc = Path.Combine(fixture.DirectoryPath, "Blu-ray disc");
+            Directory.CreateDirectory(disc);
+            fixture.Source.Path = disc;
+            fixture.Source.VideoType = VideoType.BluRay;
+            var first = Path.Combine(disc, "first'clip.m2ts");
+            var second = Path.Combine(disc, "second clip.m2ts");
+            await File.WriteAllTextAsync(first, "first", token);
+            await File.WriteAllTextAsync(second, "second", token);
+            Directory.CreateDirectory(Path.GetDirectoryName(fixture.ConcatPath)!);
+            await File.WriteAllTextAsync(fixture.ConcatPath, ConcatEntry(first, "1") + ConcatEntry(second, "2"), token);
+
+            var cache = await fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token);
+            Assert.Equal(fixture.CachePath, cache);
+            await fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token);
+            Assert.Single(await File.ReadAllLinesAsync(fixture.LogPath, token));
+            var args = await File.ReadAllLinesAsync(fixture.ArgumentsPath, token);
+            Assert.Equal(new[] { "-copyts", "-f", "concat", "-safe", "0", "-i", fixture.ConcatPath }, args.SkipWhile(arg => arg != "-copyts").Take(7));
+            fixture.MediaEncoder.Verify(x => x.GenerateConcatConfig(It.IsAny<MediaSourceInfo>(), It.IsAny<string>()), Times.Never);
+            fixture.MediaEncoder.Verify(x => x.GetInputPathArgument(It.IsAny<string>(), It.IsAny<MediaSourceInfo>()), Times.Never);
+
+            await File.AppendAllTextAsync(first, " changed", token);
+            await fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token);
+            Assert.Equal(2, (await File.ReadAllLinesAsync(fixture.LogPath, token)).Length);
+
+            File.SetLastWriteTimeUtc(second, File.GetLastWriteTimeUtc(second).AddSeconds(5));
+            await fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token);
+            Assert.Equal(3, (await File.ReadAllLinesAsync(fixture.LogPath, token)).Length);
+
+            await File.WriteAllTextAsync(fixture.ConcatPath, ConcatEntry(first, "1.5") + ConcatEntry(second, "2"), token);
+            await fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token);
+            Assert.Equal(4, (await File.ReadAllLinesAsync(fixture.LogPath, token)).Length);
+
+            File.Delete(first);
+            await Assert.ThrowsAsync<FileNotFoundException>(() => fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token));
+            Assert.Equal(4, (await File.ReadAllLinesAsync(fixture.LogPath, token)).Length);
+        }
+
+        [Fact]
+        public async Task GetHdrPgsSubtitleFilePath_BluRayCreatesMissingConcat()
+        {
+            Assert.SkipWhen(OperatingSystem.IsWindows(), "The extraction process test uses a Unix shell.");
+            using var fixture = new HdrPgsFixture("pgssub");
+            var token = TestContext.Current.CancellationToken;
+            var disc = Path.Combine(fixture.DirectoryPath, "disc");
+            Directory.CreateDirectory(disc);
+            fixture.Source.Path = disc;
+            fixture.Source.VideoType = VideoType.BluRay;
+            var segment = Path.Combine(disc, "clip.m2ts");
+            await File.WriteAllTextAsync(segment, "segment", token);
+            fixture.MediaEncoder.Setup(x => x.GenerateConcatConfig(fixture.Source, fixture.ConcatPath)).Callback(() =>
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(fixture.ConcatPath)!);
+                File.WriteAllText(fixture.ConcatPath, ConcatEntry(segment, "1"));
+            });
+
+            var results = await Task.WhenAll(Enumerable.Range(0, 5)
+                .Select(_ => fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token)));
+            Assert.All(results, path => Assert.Equal(fixture.CachePath, path));
+            fixture.MediaEncoder.Verify(x => x.GenerateConcatConfig(fixture.Source, fixture.ConcatPath), Times.Once);
+            Assert.Single(await File.ReadAllLinesAsync(fixture.LogPath, token));
+        }
+
+        [Fact]
+        public async Task GetHdrPgsSubtitleFilePath_BluRaySegmentChangedDuringExtractionFails()
+        {
+            Assert.SkipWhen(OperatingSystem.IsWindows(), "The extraction process test uses a Unix shell.");
+            using var fixture = new HdrPgsFixture("pgssub");
+            var token = TestContext.Current.CancellationToken;
+            var disc = Path.Combine(fixture.DirectoryPath, "disc");
+            Directory.CreateDirectory(disc);
+            fixture.Source.Path = disc;
+            fixture.Source.VideoType = VideoType.BluRay;
+            var segment = Path.Combine(disc, "clip.m2ts");
+            await File.WriteAllTextAsync(segment, "segment", token);
+            Directory.CreateDirectory(Path.GetDirectoryName(fixture.ConcatPath)!);
+            await File.WriteAllTextAsync(fixture.ConcatPath, ConcatEntry(segment, "1"), token);
+            await File.WriteAllTextAsync(fixture.CachePath, "previous cache", token);
+            fixture.SetScript($"printf changed >> {ShellQuote(segment)}\nprintf partial > \"$last\"\n");
+
+            await Assert.ThrowsAsync<IOException>(() => fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token));
+            Assert.Equal("previous cache", await File.ReadAllTextAsync(fixture.CachePath, token));
+            Assert.Empty(Directory.GetFiles(fixture.DirectoryPath, "*.tmp"));
+        }
+
+        [Theory]
+        [InlineData("file 'relative.m2ts'\nduration 1\n")]
+        [InlineData("option safe 0\n")]
+        public async Task GetHdrPgsSubtitleFilePath_RejectsInvalidConcat(string manifest)
+        {
+            Assert.SkipWhen(OperatingSystem.IsWindows(), "The extraction process test uses a Unix shell.");
+            using var fixture = new HdrPgsFixture("pgssub");
+            var token = TestContext.Current.CancellationToken;
+            var disc = Path.Combine(fixture.DirectoryPath, "disc");
+            Directory.CreateDirectory(disc);
+            fixture.Source.Path = disc;
+            fixture.Source.VideoType = VideoType.BluRay;
+            Directory.CreateDirectory(Path.GetDirectoryName(fixture.ConcatPath)!);
+            await File.WriteAllTextAsync(fixture.ConcatPath, manifest, token);
+
+            await Assert.ThrowsAsync<InvalidDataException>(() => fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token));
+            Assert.False(File.Exists(fixture.LogPath));
+        }
+
+        [Fact]
+        public async Task GetHdrPgsSubtitleFilePath_RejectsIncompleteConcat()
+        {
+            Assert.SkipWhen(OperatingSystem.IsWindows(), "The extraction process test uses a Unix shell.");
+            using var fixture = new HdrPgsFixture("pgssub");
+            var token = TestContext.Current.CancellationToken;
+            var disc = Path.Combine(fixture.DirectoryPath, "disc");
+            Directory.CreateDirectory(disc);
+            fixture.Source.Path = disc;
+            fixture.Source.VideoType = VideoType.BluRay;
+            var segment = Path.Combine(disc, "clip.m2ts");
+            await File.WriteAllTextAsync(segment, "segment", token);
+            Directory.CreateDirectory(Path.GetDirectoryName(fixture.ConcatPath)!);
+            await File.WriteAllTextAsync(fixture.ConcatPath, $"file {ShellQuote(segment)}\n", token);
+
+            await Assert.ThrowsAsync<InvalidDataException>(() => fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token));
+            Assert.False(File.Exists(fixture.LogPath));
+        }
+
+        [Fact]
+        public async Task GetHdrPgsSubtitleFilePath_BluRayConcatPreservesTwoClipTimeline()
+        {
+            Assert.SkipWhen(OperatingSystem.IsWindows(), "The extraction process test uses a Unix shell.");
+            var ffmpeg = FindProgram("ffmpeg");
+            var ffprobe = FindProgram("ffprobe");
+            if (ffmpeg is null || ffprobe is null)
+            {
+                Assert.Skip("FFmpeg and ffprobe are required for the concat integration test.");
+                return;
+            }
+
+            using var fixture = new HdrPgsFixture("hdmv_pgs_subtitle", ffmpeg);
+            var token = TestContext.Current.CancellationToken;
+            var disc = Path.Combine(fixture.DirectoryPath, "disc");
+            Directory.CreateDirectory(disc);
+            fixture.Source.Path = disc;
+            fixture.Source.VideoType = VideoType.BluRay;
+            fixture.Source.MediaStreams = [new MediaStream { Type = MediaStreamType.Video, Index = 0 }, fixture.Stream];
+            var inputSup = Path.Combine(fixture.DirectoryPath, "input.sup");
+            var pgs = System.Convert.FromHexString(
+                "5047000046500000465016000b028001681000010000000050470000465000004650800000"
+                + "504700020f5800020f5816000b0280016810000200000000504700020f5800020f58800000");
+            await File.WriteAllBytesAsync(inputSup, pgs, token);
+            var first = Path.Combine(disc, "first'clip.m2ts");
+            var second = Path.Combine(disc, "second clip.m2ts");
+            await Task.WhenAll(new[] { first, second }.Select(path => RunProgram(
+                ffmpeg,
+                token,
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=black:s=640x360:r=24:d=2",
+                "-f",
+                "sup",
+                "-i",
+                inputSup,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:s:0",
+                "-c:v",
+                "mpeg2video",
+                "-c:s",
+                "copy",
+                "-mpegts_m2ts_mode",
+                "1",
+                "-f",
+                "mpegts",
+                path)));
+            Directory.CreateDirectory(Path.GetDirectoryName(fixture.ConcatPath)!);
+            await File.WriteAllTextAsync(fixture.ConcatPath, ConcatEntry(first, "2") + ConcatEntry(second, "2"), token);
+
+            var sourcePts = await RunProgram(ffprobe, token, "-v", "error", "-f", "concat", "-safe", "0", "-i", fixture.ConcatPath, "-select_streams", "s:0", "-show_frames", "-show_entries", "subtitle=pts_time", "-of", "csv=p=0");
+            var cached = await fixture.Encoder.GetHdrPgsSubtitleFilePath(fixture.Stream, fixture.Source, token);
+            var cachedPts = await RunProgram(ffprobe, token, "-v", "error", "-select_streams", "s:0", "-show_frames", "-show_entries", "subtitle=pts_time", "-of", "csv=p=0", cached);
+            var timestamps = sourcePts.Trim().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+            Assert.Equal(4, timestamps.Length);
+            Assert.Equal(sourcePts.Trim(), cachedPts.Trim());
+            Assert.True(double.Parse(timestamps[2], CultureInfo.InvariantCulture) > double.Parse(timestamps[0], CultureInfo.InvariantCulture) + 1);
         }
 
         [Fact]
@@ -480,6 +678,9 @@ namespace Jellyfin.MediaEncoding.Subtitles.Tests
         }
 
         private static string ShellQuote(string value) => "'" + value.Replace("'", "'\\''", StringComparison.Ordinal) + "'";
+
+        private static string ConcatEntry(string path, string duration)
+            => $"file '{path.Replace("'", "'\\''", StringComparison.Ordinal)}'\nduration {duration}\n";
 
         private static string? FindProgram(string name)
         {
@@ -599,18 +800,21 @@ namespace Jellyfin.MediaEncoding.Subtitles.Tests
                         LastWriteTimeUtc = info.Exists ? info.LastWriteTimeUtc : DateTime.MinValue
                     };
                 });
-                var mediaEncoder = new Mock<IMediaEncoder>();
-                mediaEncoder.SetupGet(x => x.EncoderPath).Returns(executable ?? _scriptPath);
-                mediaEncoder.Setup(x => x.GetInputPathArgument(inputPath, Source)).Returns('"' + inputPath + '"');
+                MediaEncoder = new Mock<IMediaEncoder>();
+                MediaEncoder.SetupGet(x => x.EncoderPath).Returns(executable ?? _scriptPath);
+                MediaEncoder.Setup(x => x.GetInputPathArgument(inputPath, Source)).Returns('"' + inputPath + '"');
                 var paths = new Mock<IPathManager>();
                 paths.Setup(x => x.GetSubtitlePath(Source.Id, 7, ".hdr-pgs.sup")).Returns(CachePath);
                 var configuration = new Mock<IServerConfigurationManager>();
                 configuration.Setup(x => x.GetConfiguration("encoding")).Returns(new EncodingOptions());
+                var applicationPaths = new Mock<IApplicationPaths>();
+                applicationPaths.SetupGet(x => x.CachePath).Returns(DirectoryPath);
+                configuration.SetupGet(x => x.CommonApplicationPaths).Returns(applicationPaths.Object);
 
                 Encoder = new SubtitleEncoder(
                     NullLogger<SubtitleEncoder>.Instance,
                     fileSystem.Object,
-                    mediaEncoder.Object,
+                    MediaEncoder.Object,
                     Mock.Of<IHttpClientFactory>(),
                     Mock.Of<IMediaSourceManager>(),
                     Mock.Of<ISubtitleParser>(),
@@ -628,11 +832,15 @@ namespace Jellyfin.MediaEncoding.Subtitles.Tests
 
             public string OrdinaryCachePath { get; }
 
+            public string ConcatPath => Path.Join(DirectoryPath, "concat", Source.Id + ".concat");
+
             public MediaStream Stream { get; }
 
             public MediaSourceInfo Source { get; }
 
             public SubtitleEncoder Encoder { get; }
+
+            public Mock<IMediaEncoder> MediaEncoder { get; }
 
             public void SetScript(string body)
             {

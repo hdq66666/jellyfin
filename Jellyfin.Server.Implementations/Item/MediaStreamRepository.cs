@@ -153,6 +153,7 @@ public class MediaStreamRepository : IMediaStreamRepository
         dto.ColorPrimaries = entity.ColorPrimaries;
         dto.ColorSpace = entity.ColorSpace;
         dto.ColorTransfer = entity.ColorTransfer;
+        dto.ColorRange = entity.ColorRange;
         dto.DvVersionMajor = entity.DvVersionMajor;
         dto.DvVersionMinor = entity.DvVersionMinor;
         dto.DvProfile = entity.DvProfile;
@@ -233,6 +234,7 @@ public class MediaStreamRepository : IMediaStreamRepository
             ColorPrimaries = dto.ColorPrimaries,
             ColorSpace = dto.ColorSpace,
             ColorTransfer = dto.ColorTransfer,
+            ColorRange = dto.ColorRange,
             DvVersionMajor = dto.DvVersionMajor,
             DvVersionMinor = dto.DvVersionMinor,
             DvProfile = dto.DvProfile,

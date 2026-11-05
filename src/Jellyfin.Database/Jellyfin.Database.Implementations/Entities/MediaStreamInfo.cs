@@ -80,6 +80,8 @@ public class MediaStreamInfo
 
     public string? ColorTransfer { get; set; }
 
+    public string? ColorRange { get; set; }
+
     public int? DvVersionMajor { get; set; }
 
     public int? DvVersionMinor { get; set; }
